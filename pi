@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "Error: This script requires bash. Please run with: bash $0" >&2
+    exit 1
+fi
+
+set -euo pipefail
+
+CURRENT_DIR_HASH=$(printf '%s' "$PWD" | md5sum | cut -d' ' -f1)
+PI_DOCKER_CONFIG_ROOT="$HOME/.pi-docker"
+PI_API_KEY_FILES=(ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GROQ_API_KEY XAI_API_KEY HF_TOKEN)
+PI_CONTAINER_NAME_PREFIX="pi-"
+PI_CONTAINER_NAME="${PI_CONTAINER_NAME_PREFIX}${CURRENT_DIR_HASH}"
+PI_IMAGE_NAME="pi:latest"
+PI_FOLDER="${PI_DOCKER_CONFIG_ROOT}/.pi"
+PI_DEFAULT_IGNORED_FILES=(.env .deploy .secret .git .build .vscode .gitmodules .pi .aiignore .aiexclude .copilotignore .gitignore .geminiignore .codeiumignore .cursorignore .DS_Store)
+PI_IGNORE_CONFIGS=(.aiignore .aiexclude .copilotignore .gitignore .geminiignore .codeiumignore .cursorignore)
+PI_EMPTY_DIR=$(mktemp -d)
+
+cleanup() {
+    rm -rf "$PI_EMPTY_DIR" 2>/dev/null || sleep 1 && rm -rf "$PI_EMPTY_DIR" || sleep 1 && rm -rf "$PI_EMPTY_DIR"
+}
+
+trap cleanup EXIT
+
+if [[ "${1:-}" == "rebuild" ]]; then
+    EXISTING_CONTAINERS="$(docker ps -aq -f "name=${PI_CONTAINER_NAME_PREFIX}")"
+    if [[ -n "${EXISTING_CONTAINERS}" ]]; then
+        docker stop ${EXISTING_CONTAINERS} 2>/dev/null || true
+        docker rm ${EXISTING_CONTAINERS} 2>/dev/null || true
+    fi
+    docker rmi "${PI_IMAGE_NAME}" 2>/dev/null || true
+fi
+
+if [[ -z "$(docker images -q "${PI_IMAGE_NAME}" 2>/dev/null)" ]]; then
+    TEMP_BUILD_DIR=$(mktemp -d)
+    cat > "${TEMP_BUILD_DIR}/Dockerfile" <<'EOF'
+FROM node:22.17.0-alpine AS builder
+RUN npm install -g @mariozechner/pi-coding-agent
+EOF
+    docker build -t "${PI_IMAGE_NAME}" -f "${TEMP_BUILD_DIR}/Dockerfile" "${TEMP_BUILD_DIR}"
+    rm -rf "${TEMP_BUILD_DIR}"
+fi
+
+# Single docker call to check for existing container (any state)
+EXISTING=$(docker ps -aq -f "name=^${PI_CONTAINER_NAME}$" 2>/dev/null || true)
+if [[ -n "${EXISTING}" ]]; then
+    docker rm -f "${PI_CONTAINER_NAME}" 2>/dev/null || true
+fi
+
+mkdir -p "${PI_FOLDER}"
+
+EXTRA_ARGS=()
+
+# Use delimited strings for dedup lookups (compatible with bash 3 / ash)
+_IGNORED_FILES_LIST="|"
+_IGNORED_DIRS_LIST="|"
+
+_contains() {
+    case "$1" in *"|$2|"*) return 0 ;; esac
+    return 1
+}
+
+is_inside_ignored_dir() {
+    local dir="${1%/*}"
+    while [[ "${dir}" == */* ]]; do
+        _contains "${_IGNORED_DIRS_LIST}" "${dir}" && return 0
+        dir="${dir%/*}"
+    done
+    _contains "${_IGNORED_DIRS_LIST}" "${dir}" && return 0
+    return 1
+}
+
+add_ignore_dir() {
+    local dir="$1"
+    _contains "${_IGNORED_DIRS_LIST}" "${dir}" && return
+    echo "Ignoring directory ${dir}"
+    _IGNORED_DIRS_LIST="${_IGNORED_DIRS_LIST}${dir}|"
+    EXTRA_ARGS+=(-v "${PI_EMPTY_DIR}:/work_${CURRENT_DIR_HASH}/${dir}")
+}
+
+add_ignore_file() {
+    local file="$1"
+    _contains "${_IGNORED_FILES_LIST}" "${file}" && return
+    is_inside_ignored_dir "${file}" && return
+    echo "Ignoring file ${file}"
+    _IGNORED_FILES_LIST="${_IGNORED_FILES_LIST}${file}|"
+    EXTRA_ARGS+=(-v "/dev/null:/work_${CURRENT_DIR_HASH}/${file}")
+}
+
+# Collect all ignore patterns from all config files (local + global) in one pass
+ALL_PATTERNS=()
+for ignore_config in "${PI_IGNORE_CONFIGS[@]}"; do
+    for config_path in "./${ignore_config}" "${PI_DOCKER_CONFIG_ROOT}/${ignore_config}"; do
+        [[ -f "${config_path}" ]] || continue
+        while IFS= read -r pattern || [[ -n "${pattern}" ]]; do
+            [[ -z "${pattern}" || "${pattern}" == \#* ]] && continue
+            ALL_PATTERNS+=("${pattern}")
+        done < "${config_path}"
+    done
+done
+
+# Collect matched files/dirs: defaults + single find for all patterns
+MATCHED_FILES=()
+MATCHED_DIRS=()
+
+for file in "${PI_DEFAULT_IGNORED_FILES[@]}"; do
+    if [[ -f "./${file}" ]]; then
+        MATCHED_FILES+=("${file}")
+    elif [[ -d "./${file}" ]]; then
+        MATCHED_DIRS+=("${file}")
+    fi
+done
+
+# Build a single find command with all patterns ORed together
+if [[ ${#ALL_PATTERNS[@]} -gt 0 ]]; then
+    FIND_ARGS=(-mindepth 1)
+    FIND_ARGS+=( '(' -name "${ALL_PATTERNS[0]}" )
+    for ((i = 1; i < ${#ALL_PATTERNS[@]}; i++)); do
+        FIND_ARGS+=(-o -name "${ALL_PATTERNS[$i]}")
+    done
+    FIND_ARGS+=( ')' -print0 )
+
+    while IFS= read -r -d '' match; do
+        match="${match#./}"
+        if [[ -f "./${match}" ]]; then
+            MATCHED_FILES+=("${match}")
+        elif [[ -d "./${match}" ]]; then
+            MATCHED_DIRS+=("${match}")
+        fi
+    done < <(find . "${FIND_ARGS[@]}" 2>/dev/null)
+fi
+
+# Process dirs first so is_inside_ignored_dir works for files
+for dir in "${MATCHED_DIRS[@]+"${MATCHED_DIRS[@]}"}"; do
+    add_ignore_dir "${dir}"
+done
+
+for file in "${MATCHED_FILES[@]+"${MATCHED_FILES[@]}"}"; do
+    add_ignore_file "${file}"
+done
+
+# Display project tree (non-blocking, skip if tree not available)
+if command -v tree &>/dev/null; then
+    TREE_IGNORE_PATTERNS=("${PI_DEFAULT_IGNORED_FILES[@]}")
+    for pattern in "${ALL_PATTERNS[@]+"${ALL_PATTERNS[@]}"}"; do
+        TREE_IGNORE_PATTERNS+=("${pattern%/}")
+    done
+    if [[ ${#TREE_IGNORE_PATTERNS[@]} -gt 0 ]]; then
+        TREE_PATTERN=$(IFS='|'; echo "${TREE_IGNORE_PATTERNS[*]}")
+        echo ""
+        echo "Project tree (filtered by ignore configs):"
+        tree -I "${TREE_PATTERN}" --dirsfirst -a -C || true
+        echo ""
+    fi
+fi
+
+for api_key_file in "${PI_API_KEY_FILES[@]}"; do
+    api_key_path="${PI_DOCKER_CONFIG_ROOT}/${api_key_file}"
+    if [[ -f "${api_key_path}" ]]; then
+        EXTRA_ARGS+=(-e "${api_key_file}=$(sh -c "${api_key_path}")")
+    fi
+done
+
+docker run -it \
+    --rm \
+    --name "${PI_CONTAINER_NAME}" \
+    -v "${PI_FOLDER}":/root/.pi \
+    -v "$(pwd)":/work_${CURRENT_DIR_HASH} \
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
+    "${PI_IMAGE_NAME}" \
+    /bin/sh -c "cd /work_${CURRENT_DIR_HASH} && pi"
